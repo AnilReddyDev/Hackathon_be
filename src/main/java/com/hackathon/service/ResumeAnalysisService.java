@@ -9,6 +9,7 @@ import com.hackathon.exception.BadRequestException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.tika.Tika;
@@ -38,10 +39,10 @@ public class ResumeAnalysisService {
     private final GeminiCircuitBreaker circuitBreaker;
 
     public ResumeAnalysisService(RestClient.Builder restClientBuilder,
-                                 ObjectMapper objectMapper,
-                                 @Value("${gemini.api-key:}") String apiKey,
-                                 @Value("${gemini.model:gemini-2.5-flash}") String model,
-                                 GeminiCircuitBreaker circuitBreaker) {
+            ObjectMapper objectMapper,
+            @Value("${gemini.api-key:}") String apiKey,
+            @Value("${gemini.model:gemini-2.5-flash}") String model,
+            GeminiCircuitBreaker circuitBreaker) {
         this.restClient = restClientBuilder.build();
         this.objectMapper = objectMapper;
         this.apiKey = apiKey;
@@ -105,7 +106,8 @@ public class ResumeAnalysisService {
             throw new BadRequestException("Gemini API key is not configured. Set GEMINI_API_KEY or gemini.api-key.");
         }
         if (circuitBreaker.isOpen()) {
-            throw new BadRequestException("Gemini API circuit breaker is open — too many recent failures. Will retry automatically.");
+            throw new BadRequestException(
+                    "Gemini API circuit breaker is open — too many recent failures. Will retry automatically.");
         }
 
         String url = UriComponentsBuilder
@@ -169,7 +171,7 @@ public class ResumeAnalysisService {
                 {
                   "summary": "2-3 sentence objective assessment of the candidate",
                   "skills": ["skill1", "skill2"],
-                  "recommendation": "STRONG_HIRE | HIRE | BORDERLINE | REJECT — followed by one sentence justification",
+                  "recommendation": "Use one of these neutral labels followed by one short sentence of justification: STRONG_FIT | POTENTIAL_FIT | NEEDS_STRONGER_EVIDENCE | NOT_A_FIT_FOR_THIS_ROUND",
                   "strengths": ["specific strength backed by evidence in resume"],
                   "gaps": ["specific gap or concern"],
                   "redFlags": ["any of: buzzword stuffing, unexplained gaps, vague claims, inflated titles, no measurable outcomes"],
@@ -206,7 +208,8 @@ public class ResumeAnalysisService {
                 Declared experience years: %d
                 Resume text:
                 %s
-                """.formatted(declaredExperience, declaredExperience, resumeText);
+                """
+                .formatted(declaredExperience, declaredExperience, resumeText);
     }
 
     private JsonNode normalizeAnalysis(JsonNode analysis) {
@@ -214,7 +217,8 @@ public class ResumeAnalysisService {
         normalized.put("summary", text(analysis, "summary"));
         normalized.set("skills", array(analysis, "skills"));
         normalized.put("aiScore", 0);
-        normalized.put("recommendation", text(analysis, "recommendation"));
+        normalized.put("recommendation",
+                normalizeRecommendation(text(analysis, "recommendation"), text(analysis, "summary")));
         normalized.set("strengths", array(analysis, "strengths"));
         normalized.set("gaps", array(analysis, "gaps"));
         normalized.set("redFlags", array(analysis, "redFlags"));
@@ -223,64 +227,66 @@ public class ResumeAnalysisService {
         // Normalise scores sub-object; clamp each dimension to [0, 10]
         JsonNode rawScores = analysis.path("scores");
         ObjectNode scores = objectMapper.createObjectNode();
-        scores.put("technicalDepth",     clamp(rawScores.path("technicalDepth").asInt(0), 0, 10));
-        scores.put("projectQuality",     clamp(rawScores.path("projectQuality").asInt(0), 0, 10));
+        scores.put("technicalDepth", clamp(rawScores.path("technicalDepth").asInt(0), 0, 10));
+        scores.put("projectQuality", clamp(rawScores.path("projectQuality").asInt(0), 0, 10));
         scores.put("achievementClarity", clamp(rawScores.path("achievementClarity").asInt(0), 0, 10));
         scores.put("skillsAuthenticity", clamp(rawScores.path("skillsAuthenticity").asInt(0), 0, 10));
-        scores.put("consistencyScore",   clamp(rawScores.path("consistencyScore").asInt(0), 0, 10));
+        scores.put("consistencyScore", clamp(rawScores.path("consistencyScore").asInt(0), 0, 10));
         normalized.set("scores", scores);
         return normalized;
     }
 
     /**
-     * Strict dimension-based scoring. No free base score — every point must be earned.
+     * Strict dimension-based scoring. No free base score — every point must be
+     * earned.
      *
      * Positive components (max 95):
-     *   technicalDepth      0-10  × 2.0  = max 20
-     *   projectQuality      0-10  × 2.0  = max 20
-     *   achievementClarity  0-10  × 1.5  = max 15
-     *   skillsAuthenticity  0-10  × 1.5  = max 15
-     *   consistencyScore    0-10  × 1.0  = max 10
-     *   experienceScore                  = max 10 (hard-capped, penalised for mismatch)
-     *   strengthsBonus      1 per unique evidenced strength = max 5
+     * technicalDepth 0-10 × 2.0 = max 20
+     * projectQuality 0-10 × 2.0 = max 20
+     * achievementClarity 0-10 × 1.5 = max 15
+     * skillsAuthenticity 0-10 × 1.5 = max 15
+     * consistencyScore 0-10 × 1.0 = max 10
+     * experienceScore = max 10 (hard-capped, penalised for mismatch)
+     * strengthsBonus 1 per unique evidenced strength = max 5
      *
      * Penalties:
-     *   redFlagPenalty  -6 per red flag  = max -30
-     *   gapPenalty      -3 per gap       = max -15
-     *   mismatchPenalty -5 if declared experience > detected by >2 years
+     * redFlagPenalty -6 per red flag = max -30
+     * gapPenalty -3 per gap = max -15
+     * mismatchPenalty -5 if declared experience > detected by >2 years
      */
     private JsonNode addCalculatedScore(JsonNode analysis, Integer declaredExperienceYears) {
         ObjectNode scored = analysis.deepCopy();
 
         // Read Gemini-rated dimensions
         JsonNode s = scored.path("scores");
-        int technicalDepth      = clamp(s.path("technicalDepth").asInt(0), 0, 10);
-        int projectQuality      = clamp(s.path("projectQuality").asInt(0), 0, 10);
-        int achievementClarity  = clamp(s.path("achievementClarity").asInt(0), 0, 10);
-        int skillsAuthenticity  = clamp(s.path("skillsAuthenticity").asInt(0), 0, 10);
-        int consistencyScore    = clamp(s.path("consistencyScore").asInt(0), 0, 10);
+        int technicalDepth = clamp(s.path("technicalDepth").asInt(0), 0, 10);
+        int projectQuality = clamp(s.path("projectQuality").asInt(0), 0, 10);
+        int achievementClarity = clamp(s.path("achievementClarity").asInt(0), 0, 10);
+        int skillsAuthenticity = clamp(s.path("skillsAuthenticity").asInt(0), 0, 10);
+        int consistencyScore = clamp(s.path("consistencyScore").asInt(0), 0, 10);
 
-        int detectedExperience  = Math.max(0, scored.path("experienceYearsDetected").asInt(0));
-        int declaredExperience  = declaredExperienceYears == null ? 0 : Math.max(0, declaredExperienceYears);
-        int strengthsCount      = scored.path("strengths").size();
-        int gapsCount           = scored.path("gaps").size();
-        int redFlagsCount       = scored.path("redFlags").size();
+        int detectedExperience = Math.max(0, scored.path("experienceYearsDetected").asInt(0));
+        int declaredExperience = declaredExperienceYears == null ? 0 : Math.max(0, declaredExperienceYears);
+        int strengthsCount = scored.path("strengths").size();
+        int gapsCount = scored.path("gaps").size();
+        int redFlagsCount = scored.path("redFlags").size();
 
         // Positive component scores
-        int techScore        = (int) Math.round(technicalDepth     * 2.0);
-        int projScore        = (int) Math.round(projectQuality     * 2.0);
-        int achievScore      = (int) Math.round(achievementClarity * 1.5);
-        int authScore        = (int) Math.round(skillsAuthenticity * 1.5);
-        int consScore        = consistencyScore;
+        int techScore = (int) Math.round(technicalDepth * 2.0);
+        int projScore = (int) Math.round(projectQuality * 2.0);
+        int achievScore = (int) Math.round(achievementClarity * 1.5);
+        int authScore = (int) Math.round(skillsAuthenticity * 1.5);
+        int consScore = consistencyScore;
         // Experience: reward real detected years, cap at 10, penalise over-claiming
-        int experienceScore  = Math.min(10, detectedExperience * 2);
-        int strengthsBonus   = Math.min(5, strengthsCount);
+        int experienceScore = Math.min(10, detectedExperience * 2);
+        int strengthsBonus = Math.min(5, strengthsCount);
 
         // Penalties
-        int redFlagPenalty   = Math.min(30, redFlagsCount * 6);
-        int gapPenalty       = Math.min(15, gapsCount * 3);
-        // Mismatch penalty: declared years significantly exceed what resume evidence shows
-        int mismatchPenalty  = (declaredExperience - detectedExperience > 2) ? 5 : 0;
+        int redFlagPenalty = Math.min(30, redFlagsCount * 6);
+        int gapPenalty = Math.min(15, gapsCount * 3);
+        // Mismatch penalty: declared years significantly exceed what resume evidence
+        // shows
+        int mismatchPenalty = (declaredExperience - detectedExperience > 2) ? 5 : 0;
 
         int rawScore = techScore + projScore + achievScore + authScore + consScore
                 + experienceScore + strengthsBonus
@@ -289,16 +295,16 @@ public class ResumeAnalysisService {
 
         scored.put("aiScore", aiScore);
         ObjectNode breakdown = scored.putObject("scoreBreakdown");
-        breakdown.put("technicalDepthScore",   techScore);
-        breakdown.put("projectQualityScore",   projScore);
+        breakdown.put("technicalDepthScore", techScore);
+        breakdown.put("projectQualityScore", projScore);
         breakdown.put("achievementClarityScore", achievScore);
         breakdown.put("skillsAuthenticityScore", authScore);
-        breakdown.put("consistencyScore",      consScore);
-        breakdown.put("experienceScore",        experienceScore);
-        breakdown.put("strengthsBonus",         strengthsBonus);
-        breakdown.put("redFlagPenalty",        -redFlagPenalty);
-        breakdown.put("gapPenalty",            -gapPenalty);
-        breakdown.put("mismatchPenalty",       -mismatchPenalty);
+        breakdown.put("consistencyScore", consScore);
+        breakdown.put("experienceScore", experienceScore);
+        breakdown.put("strengthsBonus", strengthsBonus);
+        breakdown.put("redFlagPenalty", -redFlagPenalty);
+        breakdown.put("gapPenalty", -gapPenalty);
+        breakdown.put("mismatchPenalty", -mismatchPenalty);
         breakdown.put("declaredExperienceYears", declaredExperience);
         breakdown.put("detectedExperienceYears", detectedExperience);
         return scored;
@@ -315,8 +321,57 @@ public class ResumeAnalysisService {
         return new ResumeAnalysis(
                 skillsSummary,
                 analysis.path("aiScore").asInt(0),
-                analysis.toString()
-        );
+                analysis.toString());
+    }
+
+    private String normalizeRecommendation(String recommendation, String fallbackSummary) {
+        if (!StringUtils.hasText(recommendation)) {
+            return StringUtils.hasText(fallbackSummary) ? "Needs review — " + fallbackSummary : "Needs review";
+        }
+
+        String normalized = recommendation.trim();
+        String upper = normalized.toUpperCase(Locale.ROOT);
+        if (upper.contains("STRONG_HIRE") || upper.contains("STRONG FIT") || upper.contains("STRONG_FIT")) {
+            return "Strong fit" + appendExplanation(normalized, fallbackSummary);
+        }
+        if (upper.contains("HIRE") || upper.contains("POTENTIAL") || upper.contains("POTENTIAL_FIT")) {
+            return "Potential fit" + appendExplanation(normalized, fallbackSummary);
+        }
+        if (upper.contains("BORDERLINE") || upper.contains("NEEDS_STRONGER_EVIDENCE")
+                || upper.contains("NEEDS STRONGER EVIDENCE") || upper.contains("NEEDS IMPROVEMENT")
+                || upper.contains("NEEDS_IMPROVEMENT")) {
+            return "Needs stronger evidence" + appendExplanation(normalized, fallbackSummary);
+        }
+        if (upper.contains("REJECT") || upper.contains("NOT_A_FIT") || upper.contains("NOT A FIT")
+                || upper.contains("NOT_A_FIT_FOR_THIS_ROUND") || upper.contains("NOT FIT FOR THIS ROUND")) {
+            return "Not a fit for this round" + appendExplanation(normalized, fallbackSummary);
+        }
+        return normalized;
+    }
+
+    private String appendExplanation(String recommendation, String fallbackSummary) {
+        String explanation = extractExplanation(recommendation);
+        if (StringUtils.hasText(explanation)) {
+            return " — " + explanation;
+        }
+        if (StringUtils.hasText(fallbackSummary)) {
+            return " — " + fallbackSummary;
+        }
+        return "";
+    }
+
+    private String extractExplanation(String recommendation) {
+        String trimmed = recommendation.trim();
+        for (String separator : List.of(" — ", " - ", ": ")) {
+            int index = trimmed.indexOf(separator);
+            if (index >= 0 && index + separator.length() < trimmed.length()) {
+                String explanation = trimmed.substring(index + separator.length()).trim();
+                if (StringUtils.hasText(explanation)) {
+                    return explanation;
+                }
+            }
+        }
+        return "";
     }
 
     private String text(JsonNode node, String field) {
