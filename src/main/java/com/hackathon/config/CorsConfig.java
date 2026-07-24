@@ -15,6 +15,7 @@ public class CorsConfig {
         
         // Allow frontend origin(s)
         configuration.addAllowedOrigin("https://hackathonanil.netlify.app");
+        configuration.addAllowedOrigin("https://lbghackathon.netlify.app");
         configuration.addAllowedOrigin("http://localhost:5173");
         configuration.addAllowedOrigin("http://127.0.0.1:5173");
         configuration.addAllowedOrigin("http://localhost:3000");
